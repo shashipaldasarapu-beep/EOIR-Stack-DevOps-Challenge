@@ -1,30 +1,32 @@
+```yaml
 name: EOIR-Stack-Release-CI
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches:
+      - main
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
-
-env:
-  IMAGE_NAME: eoir-stack
-  IMAGE_TAG: "1.4.2"
 
 jobs:
+  # ==========================================
+  # JOB 1: UNIT TESTS AND MODEL VERIFICATION
+  # ==========================================
+
   test:
     name: Unit Tests and Model Verification
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -37,7 +39,12 @@ jobs:
 
       - name: Validate Python syntax
         run: |
-          python -m py_compile vision_api/app.py inference_worker/worker.py
+          python -m py_compile vision_api/app.py
+          python -m py_compile inference_worker/worker.py
+
+  # ==========================================
+  # JOB 2: BUILD AND VALIDATE CONTAINER
+  # ==========================================
 
   build:
     name: Build and Validate Container
@@ -45,62 +52,153 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Build versioned image
+      - name: Determine image tag
+        id: version
+        shell: bash
         run: |
-          docker build --pull -t $IMAGE_NAME:$IMAGE_TAG .
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="1.4.2"
+          fi
+
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building eoir-stack:$VERSION"
+
+      - name: Build Docker image
+        run: |
+          docker build --pull \
+            -t eoir-stack:${{ steps.version.outputs.tag }} .
 
       - name: Verify image size
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          SIZE=$(docker image inspect $IMAGE_NAME:$IMAGE_TAG --format '{{.Size}}')
+          SIZE=$(docker image inspect \
+            eoir-stack:$IMAGE_TAG \
+            --format='{{.Size}}')
+
           echo "Image size: $SIZE bytes"
-          test "$SIZE" -lt 220000000
 
-      - name: Verify non-root runtime
+          if [ "$SIZE" -ge 220000000 ]; then
+            echo "ERROR: Image exceeds 220 MB limit"
+            exit 1
+          fi
+
+          echo "Image size validation passed"
+
+      - name: Verify non-root runtime user
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          USER_ID=$(docker image inspect $IMAGE_NAME:$IMAGE_TAG --format '{{.Config.User}}')
-          echo "Runtime user: $USER_ID"
-          test "$USER_ID" = "10001:10001"
+          USER_ID=$(docker image inspect \
+            eoir-stack:$IMAGE_TAG \
+            --format='{{.Config.User}}')
 
-      - name: Save image artifact
+          echo "Runtime user: $USER_ID"
+
+          if [ "$USER_ID" != "10001:10001" ]; then
+            echo "ERROR: Container is not configured with expected non-root user"
+            exit 1
+          fi
+
+          echo "Non-root validation passed"
+
+      - name: Prepare release artifact
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p release
-          docker save $IMAGE_NAME:$IMAGE_TAG -o release/eoir-stack-image.tar
-          sha256sum release/eoir-stack-image.tar > release/SHA256SUMS
 
-      - name: Upload verified image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: eoir-stack-${{ env.IMAGE_TAG }}
-          path: release/
-          if-no-files-found: error
-          retention-days: 30
+          docker save \
+            -o release/eoir-stack-image.tar \
+            eoir-stack:$IMAGE_TAG
 
-  promote:
-    name: Release Promotion
-    needs: [test, build]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+      - name: Generate release checksums
+        run: |
+          cd release
+          sha256sum eoir-stack-image.tar > SHA256SUMS
 
-    steps:
-      - name: Download verified image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: eoir-stack-${{ env.IMAGE_TAG }}
-          path: release/
+          echo "Generated release checksum:"
+          cat SHA256SUMS
 
-      - name: Verify release checksum
+      - name: Verify generated checksum
         run: |
           cd release
           sha256sum --check SHA256SUMS
 
-      - name: Load verified image
-        run: docker load -i release/eoir-stack-image.tar
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eoir-stack-${{ steps.version.outputs.tag }}
+          path: release/
+          retention-days: 30
 
-      - name: Confirm promoted image
+  # ==========================================
+  # JOB 3: RELEASE PROMOTION
+  # ==========================================
+
+  promote:
+    name: Release Promotion
+    needs:
+      - test
+      - build
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine release version
+        id: version
+        shell: bash
         run: |
-          docker image inspect $IMAGE_NAME:$IMAGE_TAG
-          echo "Verified image is ready for controlled release."
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Download verified release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: eoir-stack-${{ steps.version.outputs.tag }}
+          path: release
+
+      - name: Verify release checksum
+        run: |
+          cd release
+
+          echo "Verifying release integrity..."
+
+          sha256sum --check SHA256SUMS
+
+          echo "Release checksum verification passed"
+
+      - name: Load Docker image
+        run: |
+          docker load -i release/eoir-stack-image.tar
+
+      - name: Verify promoted image
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          docker image inspect eoir-stack:$IMAGE_TAG
+
+          echo "Release image verified successfully"
+
+      - name: Release promotion summary
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          echo "=================================="
+          echo "EOIR STACK RELEASE PROMOTION"
+          echo "=================================="
+          echo "Release version: $IMAGE_TAG"
+          echo "Git reference: $GITHUB_REF"
+          echo "Image: eoir-stack:$IMAGE_TAG"
+          echo "Checksum verification: PASSED"
+          echo "Docker image loading: PASSED"
+          echo "Release promotion: SUCCESS"
+          echo "=================================="
+```

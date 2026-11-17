@@ -1,11 +1,20 @@
+# Environment secrets
 .env
+.env.*
+!.env.example
+
+# Air-gap release artifacts
+airgap_release/
+release/
+release_v*.tar.gz
+
+# Python generated files
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
 venv/
+
+# Logs and system files
 *.log
 .DS_Store
-# Air-gap release artifacts
-airgap_release/
-release_v*.tar.gz
