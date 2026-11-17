@@ -1,77 +1,59 @@
 # EOIR Stack – Operations Runbook
 
-**Release:** v1.4.2  
-**Application:** Edge Object Intelligence & Recognition  
-**Deployment:** Docker Compose / Air-Gap  
+**Release:** v1.4.2
+**Application:** Edge Object Intelligence & Recognition
+**Deployment:** Docker Compose / Air-Gap
 **Maintainer:** DevOps Team
 
 ## 1. System Overview
 
-EOIR Stack consists of three services:
+EOIR Stack contains three services:
 
-- **vision_api:** Exposes the HTTP API on port 8000.
-- **inference_worker:** Verifies model integrity and provides detection responses on port 9000.
-- **postgres:** Stores persistent database data.
+| Service | Responsibility |
+|---|---|
+| `vision_api` | HTTP API exposed on port 8000 |
+| `inference_worker` | Engine integrity verification and detection endpoint on port 9000 |
+| `postgres` | Persistent PostgreSQL database |
 
-The API and worker communicate over the internal Docker network. PostgreSQL data is stored in a persistent Docker volume.
+The API communicates with the worker through Docker service DNS. PostgreSQL data is stored in a named Docker volume.
 
-> Current implementation note: The supplied engine is a simulation fixture. Detection responses use CPU simulation, not actual TensorRT/GPU inference.
+**Implementation limitation:** The supplied engine is a simulation fixture. Detection currently uses CPU simulation, not actual TensorRT or GPU inference. GPU compatibility guidance below describes requirements for a future production TensorRT implementation.
 
-## 2. Identified Issues and Remediation
+## 2. Original Issues and Remediation
 
-| Original issue | Root cause | Remediation |
-|---|---|---|
-| Oversized Docker image | Full Python image and unnecessary OS packages | Multi-stage build using Python slim |
-| Container ran as root | No non-root runtime user | Runtime user UID/GID 10001 |
-| Hardcoded database credentials | Credentials embedded in Compose | Environment variables and `.env.example`; local `.env` excluded from Git |
-| Incorrect worker URL | API used localhost instead of service DNS | `http://inference_worker:9000` |
-| API started before dependencies were ready | Missing service readiness conditions | Compose health checks and `depends_on` conditions |
-| Worker always appeared healthy | Health check did not verify engine integrity | Worker status endpoint validates manifest and SHA256 |
-| Engine checksum mismatch | Manifest did not match the supplied engine file | Updated manifest checksum and verification test |
-| API did not depend on worker readiness | Startup and request handling did not verify worker status | API checks worker health and returns HTTP 503 when unavailable |
-| Weak CI quality gates | Tests could be ignored and promotion was not gated | Test job, dependent build job, image verification and gated promotion |
-| Mutable image tagging | Release relied on a mutable tag | Versioned image tag `eoir-stack:1.4.2` |
-| No reliable offline deployment | Images and deployment files were not packaged together | Air-gap packaging and SHA256 verification scripts |
+| Original issue | Affected file | Root cause | Remediation |
+|---|---|---|---|
+| Oversized image | `Dockerfile` | Full Python image and unnecessary packages | Slim multi-stage build |
+| Root runtime | `Dockerfile` | No dedicated runtime user | Non-root UID/GID 10001 |
+| Hardcoded credentials | `docker-compose.yml` | Credentials embedded in Compose | Environment variables and ignored `.env` |
+| Incorrect worker URL | `vision_api/app.py` | Used localhost instead of service DNS | `http://inference_worker:9000` |
+| Premature API startup | `docker-compose.yml` | Missing readiness checks | Health checks and dependency conditions |
+| False worker health | `inference_worker/worker.py` | Health check did not validate engine integrity | Manifest and SHA256 verification |
+| Engine checksum mismatch | `models/manifest.json` | Manifest did not match supplied engine | Corrected SHA256 and verification test |
+| Missing readiness handling | `vision_api/app.py` | API did not reliably check worker status | Worker status check and HTTP 503 on failure |
+| Weak CI gates | `.github/workflows/ci.yml` | Tests could be ignored and promotion was not gated | Test → build → verify → promotion |
+| Mutable image tagging | CI workflow and Compose | Release image identification was inconsistent | Versioned image tag |
+| Missing offline packaging | `scripts/` | Images and deployment files were not distributed together | Air-gap archive and SHA256SUMS |
 
-File locations to inspect:
-- `Dockerfile`
-- `docker-compose.yml`
-- `vision_api/app.py`
-- `inference_worker/worker.py`
-- `models/manifest.json`
-- `tests/`
-- `.github/workflows/ci.yml`
-- `scripts/`
+For exact historical source line numbers, consult the original source and Git diff. Do not infer line numbers from revised files.
 
 ## 3. Configuration and Startup
 
-Create a local environment file from the example:
+Create a secure environment file:
 
 ```bash
 cp .env.example .env
+chmod 600 .env
 ```
 
-Edit `.env` and provide a strong database password. Never commit `.env`.
+Set a strong PostgreSQL password in `.env`. Never commit `.env`.
 
-Start the services:
+Start the stack:
 
 ```bash
 docker compose up -d --build
-```
-
-Check service status:
-
-```bash
 docker compose ps
 ```
-
-Check logs:
-
-```bash
-docker compose logs -f
-```
-
-## 4. Health and API Verification
 
 Check API health:
 
@@ -79,147 +61,136 @@ Check API health:
 curl -i http://localhost:8000/health
 ```
 
-Expected healthy response:
+Expected response:
 
 ```json
 {"status":"healthy","worker_ready":true}
 ```
 
-Check detection:
+Test detection:
 
 ```bash
 curl -i http://localhost:8000/api/v1/detect
 ```
 
-The current implementation returns a simulated detection response.
+The current implementation returns simulated CPU detection results.
 
-Check worker health:
+## 4. Health Monitoring and Failure Recovery
 
-```bash
-docker inspect eoir-stack-inference_worker-1 \
-  --format '{{.State.Health.Status}}'
-```
-
-Expected status:
-
-```text
-healthy
-```
-
-## 5. Engine Corruption and Recovery
-
-The worker verifies the engine checksum against `models/manifest.json`.
-
-To simulate engine corruption in a test environment:
+Check service health:
 
 ```bash
-docker exec eoir-stack-inference_worker-1 sh -c \
-  'printf CORRUPTED_ENGINE_TEST > /app/models/eo_detector_fp16.engine'
+docker compose ps
+docker compose logs --tail=100 inference_worker
+docker compose logs --tail=100 vision_api
 ```
 
-Wait for the health check:
+The worker health check verifies engine integrity against the model manifest. A corrupted or invalid engine should cause the worker to become unhealthy within the configured health-check period.
+
+To test recovery in a non-production environment:
 
 ```bash
-sleep 12
-docker inspect eoir-stack-inference_worker-1 \
-  --format '{{.State.Health.Status}}'
+docker exec eoir-stack-inference_worker-1 sh -c 'printf "CORRUPTED_ENGINE_TEST" > /app/models/eo_detector_fp16.engine'
 ```
 
-Expected result:
-
-```text
-unhealthy
-```
-
-Restore the worker from the image:
+Wait for the health check to report `unhealthy`. Restore the worker from its image:
 
 ```bash
-docker compose up -d --force-recreate inference_worker
+docker compose up -d --no-deps --force-recreate inference_worker
 ```
 
 Verify recovery:
 
 ```bash
 docker compose ps
-curl -i http://localhost:8000/health
+curl http://localhost:8000/health
 ```
 
-**Warning:** Perform corruption testing only in a test deployment, never on a production worker.
+## 5. Air-Gap Release and Deployment
 
-## 6. Air-Gap Packaging and Deployment
-
-On the connected build machine:
+Build the offline release package on the connected build machine:
 
 ```bash
 bash scripts/package_airgap.sh
 ```
 
-The script creates:
+Transfer `release_v1.4.2.tar.gz` to the offline target.
 
-```text
-release_v1.4.2.tar.gz
-```
-
-Transfer the archive to the offline target.
-
-Extract it:
+On the target, extract and verify the archive before loading images:
 
 ```bash
 tar -xzf release_v1.4.2.tar.gz
-```
-
-Verify package integrity:
-
-```bash
 cd airgap_release
-sha256sum --check SHA256SUMS
+sha256sum -c SHA256SUMS
 ```
 
-Only continue if every checksum passes.
-
-Load the packaged images:
+Only continue if every checksum passes. Load the packaged images:
 
 ```bash
 docker load -i images/docker-images.tar
 ```
 
-Prepare deployment configuration:
+Copy the deployment files to the deployment directory, create a secure `.env` using `.env.example`, and start the stack:
 
 ```bash
-mkdir -p /opt/eoir-stack
-cp deployment/docker-compose.yml /opt/eoir-stack/
-cp deployment/.env.example /opt/eoir-stack/.env
+docker compose up -d --no-build --pull never
+docker compose ps
 ```
 
-Edit `/opt/eoir-stack/.env` with secure deployment credentials.
+No registry access or internet connection should be required when all required images are packaged.
 
-Start without building or pulling images:
+## 6. Fifteen-Minute Release Rollback
+
+**Minute 0–3: Stop promotion**
+- Stop further deployment or release promotion.
+- Preserve logs and identify the last known-good release archive.
+
+**Minute 3–7: Restore previous release**
+- Extract the previous verified release archive.
+- Verify its `SHA256SUMS`.
+- Load its Docker images using `docker load`.
+- Restore its Compose configuration and deployment files.
+
+**Minute 7–11: Restart services**
 
 ```bash
-cd /opt/eoir-stack
+docker compose down
 docker compose up -d --no-build --pull never
 ```
 
-Verify:
+Do not delete the PostgreSQL named volume during rollback.
 
-```bash
-docker compose ps
-```
+**Minute 11–15: Validate**
+- Check `docker compose ps`.
+- Check `http://localhost:8000/health`.
+- Test `/api/v1/detect`.
+- Review service logs.
+- Confirm database persistence and notify the team.
 
-## 7. Fifteen-Minute Release Rollback Procedure
+Keep previous verified release archives available so rollback does not depend on internet access.
 
-**Scenario:** A newly promoted engine or application release fails after deployment.
+## 7. CUDA, TensorRT and Jetson Orin Compatibility
 
-**Minute 0–3: Detect and assess**
-- Check API health and worker health.
-- Inspect worker and API logs.
-- Confirm whether the failure is related to engine integrity, application startup or architecture compatibility.
+The current release uses CPU simulation and does not execute TensorRT inference.
 
-```bash
-docker compose ps
-docker compose logs --tail=100 inference_worker vision_api
-```
+For a future GPU-enabled release:
 
-**Minute 3–5: Stop further promotion**
-- Pause additional deployment activity.
-- Preserve
+- Build separate runtime images for the intended architecture.
+- Standard x86_64 NVIDIA deployments and Jetson Orin aarch64 deployments require compatible platform-specific dependencies.
+- Match CUDA, TensorRT, NVIDIA driver and JetPack versions to the target platform.
+- Build or validate TensorRT engines on compatible target hardware.
+- Do not assume an x86_64 TensorRT engine will run on Jetson Orin.
+- Validate engine loading, inference, memory usage and GPU access on the actual deployment device.
+
+## 8. Release Checklist
+
+- [ ] Unit tests pass.
+- [ ] Model checksum verification passes.
+- [ ] CI build and artifact verification pass.
+- [ ] Runtime image is below 220 MB.
+- [ ] Runtime uses a non-root user.
+- [ ] No secrets are committed.
+- [ ] API health and detection endpoints respond correctly.
+- [ ] Worker corruption test detects failure.
+- [ ] Air-gap archive checksums pass.
+- [ ] Offline deployment and rollback procedures are documented.
