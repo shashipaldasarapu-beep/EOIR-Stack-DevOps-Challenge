@@ -1,4 +1,3 @@
-```yaml
 name: EOIR-Stack-Release-CI
 
 on:
@@ -201,4 +200,3 @@ jobs:
           echo "Docker image loading: PASSED"
           echo "Release promotion: SUCCESS"
           echo "=================================="
-```
