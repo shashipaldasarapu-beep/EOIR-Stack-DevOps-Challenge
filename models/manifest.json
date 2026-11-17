@@ -1,0 +1,16 @@
+{
+  "model_name": "eo_detector_fp16",
+  "version": "1.4.2",
+  "target_arch": [
+    "x86_64",
+    "aarch64"
+  ],
+  "input_resolution": [
+    1920,
+    1080
+  ],
+  "precision": "FP16",
+  "artifact_type": "challenge_simulation_fixture",
+  "inference_mode": "cpu_simulation",
+  "sha256": "0AAF46816A9506A903462A0FBCB4CE8589CE046CD52DFDEF6CDDF167686E4702"
+}

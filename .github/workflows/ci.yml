@@ -1,0 +1,106 @@
+name: EOIR-Stack-Release-CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: eoir-stack
+  IMAGE_TAG: "1.4.2"
+
+jobs:
+  test:
+    name: Unit Tests and Model Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify model checksum
+        run: python tests/verify_model.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile vision_api/app.py inference_worker/worker.py
+
+  build:
+    name: Build and Validate Container
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build versioned image
+        run: |
+          docker build --pull -t $IMAGE_NAME:$IMAGE_TAG .
+
+      - name: Verify image size
+        run: |
+          SIZE=$(docker image inspect $IMAGE_NAME:$IMAGE_TAG --format '{{.Size}}')
+          echo "Image size: $SIZE bytes"
+          test "$SIZE" -lt 220000000
+
+      - name: Verify non-root runtime
+        run: |
+          USER_ID=$(docker image inspect $IMAGE_NAME:$IMAGE_TAG --format '{{.Config.User}}')
+          echo "Runtime user: $USER_ID"
+          test "$USER_ID" = "10001:10001"
+
+      - name: Save image artifact
+        run: |
+          mkdir -p release
+          docker save $IMAGE_NAME:$IMAGE_TAG -o release/eoir-stack-image.tar
+          sha256sum release/eoir-stack-image.tar > release/SHA256SUMS
+
+      - name: Upload verified image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eoir-stack-${{ env.IMAGE_TAG }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  promote:
+    name: Release Promotion
+    needs: [test, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download verified image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: eoir-stack-${{ env.IMAGE_TAG }}
+          path: release/
+
+      - name: Verify release checksum
+        run: |
+          cd release
+          sha256sum --check SHA256SUMS
+
+      - name: Load verified image
+        run: docker load -i release/eoir-stack-image.tar
+
+      - name: Confirm promoted image
+        run: |
+          docker image inspect $IMAGE_NAME:$IMAGE_TAG
+          echo "Verified image is ready for controlled release."
+

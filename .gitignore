@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.log
+.DS_Store
+# Air-gap release artifacts
+airgap_release/
+release_v*.tar.gz
